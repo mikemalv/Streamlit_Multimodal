@@ -15,7 +15,6 @@ A comprehensive image analysis system for processing and analyzing images using 
 - **⚠️ Important**: Go to the bottom section labeled **"v3"** for:
   - Table setup queries
   - Analysis queries  
-  - Various utility queries
 
 ## Quick Start
 
