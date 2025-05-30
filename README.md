@@ -1,47 +1,26 @@
-Image Analysis Project
+# Image Analysis Project
+
 A comprehensive image analysis system for processing and analyzing images using Snowflake and Streamlit.
-📁 Key Files
-Streamlit_Application.py
 
-Purpose: Web-based image uploader interface
-Features: Upload and process multiple images through an intuitive Streamlit UI
-Usage: Run this file to launch the image upload application
+## Files Overview
 
-Image_Notebook.ipynb
+### `Streamlit_Application.py`
+**Image uploader interface**
+- Web-based UI for uploading and processing multiple images
+- Built with Streamlit for easy interaction
 
-Purpose: Core analysis logic and database setup
-Important: Navigate to the bottom section labeled "v3" for:
+### `Image_Notebook.ipynb`
+**Core analysis and database setup**
+- Contains all analysis logic and database configurations
+- **⚠️ Important**: Go to the bottom section labeled **"v3"** for:
+  - Table setup queries
+  - Analysis queries  
+  - Various utility queries
 
-🗄️ Table setup queries - Database schema and initialization
-🔍 Analysis queries - Image processing and data extraction logic
-📊 Various utility queries - Supporting database operations
+## Quick Start
 
-
-
-🚀 Quick Start
-
-Launch the application:
-bashstreamlit run Streamlit_Application.py
-
-Database setup:
-
-Open Image_Notebook.ipynb
-Go to the bottom (v3 section)
-Run the table setup queries first
-Execute additional queries as needed
-
-
-
-📋 Setup Requirements
-
-Streamlit
-Snowflake connection
-Jupyter Notebook environment
-Required Python packages (see notebook imports)
-
-🔧 Configuration
-Refer to the v3 section in Image_Notebook.ipynb for:
-
-Database table schemas
-Connection configurations
-Query examples and templates
+1. **Run the Streamlit app:**
+2. **Set up the database:**
+- Open Image_Notebook.ipynb
+- Navigate to the v3 section at the bottom
+- Execute the table setup queries first
