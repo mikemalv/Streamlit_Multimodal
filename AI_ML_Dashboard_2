@@ -1,0 +1,1529 @@
+import streamlit as st
+import pandas as pd
+import altair as alt
+from datetime import datetime, timedelta
+import time
+import numpy as np
+from snowflake.snowpark.context import get_active_session
+
+# Clear all caches to ensure fresh data
+if 'clear_cache' not in st.session_state:
+    st.cache_data.clear()
+    st.session_state.clear_cache = True
+
+# Configure the page
+st.set_page_config(
+    page_title="AI/ML Cost Monitoring Dashboard",
+    page_icon="📊",
+    layout="wide"
+)
+
+# Get the active Snowflake session
+session = get_active_session()
+
+# Add title and description
+st.title("🤖 AI/ML Cost Monitoring Dashboard")
+st.markdown("Monitor your Snowflake AI/ML usage, tokens, costs, and performance across Cortex services.")
+
+# Sidebar filters (shared across tabs)
+st.sidebar.header("Filters")
+date_range = st.sidebar.selectbox(
+    "Date Range",
+    ["Last 1 day", "Last 7 days", "Last 14 days", "Last 30 days", "Last 60 days", "Last 90 days", "Last 180 days", "Last 365 days"],
+    index=2  # Default to 14 days for better overview
+)
+
+# Price per credit selector
+st.sidebar.markdown("---")
+st.sidebar.header("Pricing")
+price_option = st.sidebar.selectbox(
+    "Price per Credit",
+    ["$2.00", "$3.00", "$4.00", "Custom"],
+    index=0
+)
+
+if price_option == "Custom":
+    price_per_credit = st.sidebar.number_input(
+        "Enter custom price per credit ($)",
+        min_value=0.01,
+        max_value=100.00,
+        value=2.00,
+        step=0.01,
+        format="%.2f"
+    )
+else:
+    price_per_credit = float(price_option.replace("$", ""))
+
+# Add a refresh button in the sidebar
+st.sidebar.markdown("---")
+if st.sidebar.button("🔄 Refresh Data"):
+    st.cache_data.clear()
+    st.rerun()
+
+# Convert date range to days
+days_mapping = {
+    "Last 1 day": 1,
+    "Last 7 days": 7,
+    "Last 14 days": 14,
+    "Last 30 days": 30,
+    "Last 60 days": 60,
+    "Last 90 days": 90,
+    "Last 180 days": 180,
+    "Last 365 days": 365
+}
+days_to_fetch = days_mapping[date_range]
+
+# Helper function to check table schema with proper error handling
+@st.cache_data(ttl=86400)  # Cache for 24 hours
+def get_table_columns(table_name):
+    """Get available columns for a table using collect() method"""
+    try:
+        query = f"DESCRIBE TABLE {table_name}"
+        rows = session.sql(query).collect()
+        return [row['name'] for row in rows] if rows else []
+    except Exception as e:
+        return []
+
+@st.cache_data(ttl=86400)
+def test_table_access(table_name):
+    """Test if we can access a table and return basic info about it"""
+    try:
+        # Try a simple SELECT with LIMIT 1 to test access
+        query = f"SELECT * FROM {table_name} LIMIT 1"
+        result = session.sql(query).collect()
+        if result:
+            # Get column names from the first row
+            return list(result[0].as_dict().keys())
+        else:
+            return []
+    except Exception as e:
+        return []
+
+# Test table access and get schemas
+st.info("🔍 Detecting available AI/ML data sources...")
+
+# Test each table
+table_info = {
+    'cortex_functions': {
+        'table': 'SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FUNCTIONS_USAGE_HISTORY',
+        'columns': test_table_access('SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FUNCTIONS_USAGE_HISTORY'),
+        'available': False
+    },
+    'query_usage': {
+        'table': 'SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FUNCTIONS_QUERY_USAGE_HISTORY', 
+        'columns': test_table_access('SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FUNCTIONS_QUERY_USAGE_HISTORY'),
+        'available': False
+    },
+    'document_ai': {
+        'table': 'SNOWFLAKE.ACCOUNT_USAGE.DOCUMENT_AI_USAGE_HISTORY',
+        'columns': test_table_access('SNOWFLAKE.ACCOUNT_USAGE.DOCUMENT_AI_USAGE_HISTORY'),
+        'available': False
+    },
+    'search_serving': {
+        'table': 'SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_SERVING_USAGE_HISTORY',
+        'columns': test_table_access('SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_SERVING_USAGE_HISTORY'),
+        'available': False
+    },
+    'cortex_analyst': {
+        'table': 'SNOWFLAKE.ACCOUNT_USAGE.CORTEX_ANALYST_USAGE_HISTORY',
+        'columns': test_table_access('SNOWFLAKE.ACCOUNT_USAGE.CORTEX_ANALYST_USAGE_HISTORY'),
+        'available': False
+    },
+    'cortex_search': {
+        'table': 'SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_DAILY_USAGE_HISTORY',
+        'columns': test_table_access('SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_DAILY_USAGE_HISTORY'),
+        'available': False
+    }
+}
+
+# Update availability
+for key, info in table_info.items():
+    info['available'] = len(info['columns']) > 0
+
+# Show available data sources
+available_sources = [key for key, info in table_info.items() if info['available']]
+
+# Display detected schemas for debugging
+with st.expander("🔧 Debug: Detected Table Schemas"):
+    for key, info in table_info.items():
+        if info['available']:
+            st.write(f"**{key}:** {info['columns']}")
+        else:
+            st.write(f"**{key}:** Not accessible")
+
+def create_multiselect_with_all(label, options, key_prefix):
+    """Create multiselect with Select All/Deselect All functionality"""
+    if not options:
+        st.info(f"No {label.lower()} available")
+        return []
+        
+    col1, col2, col3 = st.columns([3, 1, 1])
+    
+    with col1:
+        # Initialize session state for this multiselect if it doesn't exist
+        if f"{key_prefix}_selected" not in st.session_state:
+            st.session_state[f"{key_prefix}_selected"] = options
+        
+        selected = st.multiselect(
+            label,
+            options,
+            default=st.session_state[f"{key_prefix}_selected"],
+            key=f"{key_prefix}_multiselect"
+        )
+    
+    with col2:
+        if st.button("Select All", key=f"{key_prefix}_select_all"):
+            st.session_state[f"{key_prefix}_selected"] = options
+            st.rerun()
+    
+    with col3:
+        if st.button("Deselect All", key=f"{key_prefix}_deselect_all"):
+            st.session_state[f"{key_prefix}_selected"] = []
+            st.rerun()
+    
+    # Update session state
+    st.session_state[f"{key_prefix}_selected"] = selected
+    return selected
+
+# Robust data fetching functions
+@st.cache_data(ttl=3600)
+def get_cortex_functions_data(days):
+    """Fetch Cortex Functions data with dynamic column detection"""
+    if 'cortex_functions' not in table_info or not table_info['cortex_functions']['available']:
+        return pd.DataFrame()
+    
+    try:
+        columns = table_info['cortex_functions']['columns']
+        table = table_info['cortex_functions']['table']
+        
+        # Find the correct column names (they might vary between Snowflake versions)
+        start_time_col = None
+        for col in columns:
+            if 'START_TIME' in col.upper() or 'TIME' in col.upper():
+                start_time_col = col
+                break
+        
+        if not start_time_col:
+            st.warning("Could not find timestamp column in CORTEX_FUNCTIONS_USAGE_HISTORY")
+            return pd.DataFrame()
+        
+        # Build query with available columns
+        select_parts = [
+            f"DATE_TRUNC('DAY', {start_time_col}) AS USAGE_DATE"
+        ]
+        
+        # Note: Hourly granularity is disabled to ensure compatibility
+        # across different Snowflake editions and configurations
+        
+        # Required columns
+        required_cols = ['FUNCTION_NAME', 'MODEL_NAME', 'TOKENS', 'TOKEN_CREDITS']
+        available_required = [col for col in required_cols if col in columns]
+        
+        if len(available_required) < 3:  # Need at least function, tokens, credits
+            st.warning(f"Missing required columns in CORTEX_FUNCTIONS_USAGE_HISTORY. Available: {columns}")
+            return pd.DataFrame()
+        
+        select_parts.extend(available_required)
+        
+        # Optional columns
+        optional_cols = ['USER_NAME', 'ROLE_NAME', 'WAREHOUSE_NAME']
+        for col in optional_cols:
+            if col in columns:
+                select_parts.append(col)
+        
+        # Aggregation columns
+        agg_parts = [
+            "COUNT(*) AS TOTAL_REQUESTS"
+        ]
+        
+        if 'TOKENS' in columns:
+            agg_parts.append("SUM(TOKENS) AS TOTAL_TOKENS")
+        if 'TOKEN_CREDITS' in columns:
+            agg_parts.append("SUM(TOKEN_CREDITS) AS TOTAL_CREDITS")
+        
+        # Build GROUP BY
+        group_by = ["USAGE_DATE"]
+        
+        # Add required columns to group by
+        group_by.extend(available_required)
+        
+        # Optional grouping columns
+        for col in optional_cols:
+            if col in columns:
+                group_by.append(col)
+        
+        # Time filter
+        if days == 1:
+            time_filter = f"{start_time_col} >= DATE_TRUNC('DAY', CURRENT_TIMESTAMP)"
+        else:
+            time_filter = f"{start_time_col} >= DATEADD(day, -{days}, CURRENT_TIMESTAMP)"
+        
+        # Final query
+        query = f"""
+        SELECT {', '.join(select_parts + agg_parts)}
+        FROM {table}
+        WHERE {time_filter}
+        GROUP BY {', '.join(group_by)}
+        ORDER BY USAGE_DATE DESC, TOTAL_CREDITS DESC
+        LIMIT 5000
+        """
+        
+        return session.sql(query).to_pandas()
+        
+    except Exception as e:
+        st.error(f"Error fetching Cortex Functions data: {str(e)}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=3600)
+def get_cortex_analyst_data(days):
+    """Fetch Cortex Analyst usage data"""
+    if 'cortex_analyst' not in table_info or not table_info['cortex_analyst']['available']:
+        return pd.DataFrame()
+    
+    try:
+        columns = table_info['cortex_analyst']['columns']
+        table = table_info['cortex_analyst']['table']
+        
+        # Build query dynamically based on available columns
+        # Core columns that should exist
+        select_parts = []
+        group_by_parts = []
+        
+        # Time columns
+        time_col = None
+        for col in ['START_TIME', 'USAGE_DATE', 'TIMESTAMP']:
+            if col in columns:
+                time_col = col
+                break
+        
+        if not time_col:
+            st.warning("Could not find timestamp column in CORTEX_ANALYST_USAGE_HISTORY")
+            return pd.DataFrame()
+        
+        # Add date truncation
+        select_parts.append(f"DATE_TRUNC('DAY', {time_col}) AS USAGE_DATE")
+        group_by_parts.append("USAGE_DATE")
+        
+        # Add available dimension columns
+        dimension_cols = ['DATABASE_ID', 'SCHEMA_ID', 'SERVICE_NAME', 'SERVICE_ID', 'MODEL_NAME', 
+                         'USER_NAME', 'ROLE_NAME', 'WAREHOUSE_NAME']
+        
+        for col in dimension_cols:
+            if col in columns:
+                select_parts.append(col)
+                group_by_parts.append(col)
+        
+        # Add aggregation columns
+        agg_parts = ["COUNT(*) AS TOTAL_QUERIES"]
+        
+        # Token columns
+        if 'TOKENS_INPUT' in columns:
+            agg_parts.append("SUM(TOKENS_INPUT) AS TOTAL_INPUT_TOKENS")
+        if 'TOKENS_OUTPUT' in columns:
+            agg_parts.append("SUM(TOKENS_OUTPUT) AS TOTAL_OUTPUT_TOKENS")
+        if 'TOKENS_INPUT' in columns and 'TOKENS_OUTPUT' in columns:
+            agg_parts.append("SUM(TOKENS_INPUT + TOKENS_OUTPUT) AS TOTAL_TOKENS")
+        elif 'TOTAL_TOKENS' in columns:
+            agg_parts.append("SUM(TOTAL_TOKENS) AS TOTAL_TOKENS")
+        
+        # Credits column
+        if 'CREDITS_USED' in columns:
+            agg_parts.append("SUM(CREDITS_USED) AS TOTAL_CREDITS")
+        elif 'CREDITS' in columns:
+            agg_parts.append("SUM(CREDITS) AS TOTAL_CREDITS")
+        
+        # Time filter
+        if days == 1:
+            time_filter = f"{time_col} >= DATE_TRUNC('DAY', CURRENT_TIMESTAMP)"
+        else:
+            time_filter = f"{time_col} >= DATEADD(day, -{days}, CURRENT_TIMESTAMP)"
+        
+        # Final query
+        query = f"""
+        SELECT {', '.join(select_parts + agg_parts)}
+        FROM {table}
+        WHERE {time_filter}
+        GROUP BY {', '.join(group_by_parts)}
+        ORDER BY USAGE_DATE DESC
+        LIMIT 5000
+        """
+        
+        return session.sql(query).to_pandas()
+        
+    except Exception as e:
+        st.error(f"Error fetching Cortex Analyst data: {str(e)}")
+        # Log available columns for debugging
+        if 'cortex_analyst' in table_info and table_info['cortex_analyst']['columns']:
+            st.info(f"Available columns: {', '.join(table_info['cortex_analyst']['columns'])}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=3600)
+def get_cortex_search_data(days):
+    """Fetch Cortex Search daily usage data"""
+    if 'cortex_search' not in table_info or not table_info['cortex_search']['available']:
+        return pd.DataFrame()
+    
+    try:
+        columns = table_info['cortex_search']['columns']
+        table = table_info['cortex_search']['table']
+        
+        # Build query dynamically based on available columns
+        select_parts = []
+        
+        # Date column (should be USAGE_DATE for daily usage table)
+        if 'USAGE_DATE' in columns:
+            select_parts.append("USAGE_DATE")
+        else:
+            st.warning("Could not find USAGE_DATE column in CORTEX_SEARCH_DAILY_USAGE_HISTORY")
+            return pd.DataFrame()
+        
+        # Add available dimension columns
+        dimension_cols = ['DATABASE_ID', 'DATABASE_NAME', 'SCHEMA_ID', 'SCHEMA_NAME', 
+                         'SERVICE_NAME', 'SERVICE_ID', 'SERVICE_TYPE']
+        
+        for col in dimension_cols:
+            if col in columns:
+                select_parts.append(col)
+        
+        # Add metric columns (no aggregation needed for daily table)
+        metric_cols = ['SEARCH_REQUEST_COUNT', 'SEARCH_RESULT_RANK_COUNT']
+        
+        for col in metric_cols:
+            if col in columns:
+                select_parts.append(col)
+        
+        # Handle credits column - avoid duplicates
+        if 'CREDITS_USED' in columns:
+            select_parts.append("CREDITS_USED AS TOTAL_CREDITS")
+        elif 'CREDITS' in columns:
+            select_parts.append("CREDITS AS TOTAL_CREDITS")
+        
+        # Time filter
+        if days == 1:
+            time_filter = "USAGE_DATE >= DATE_TRUNC('DAY', CURRENT_TIMESTAMP)"
+        else:
+            time_filter = f"USAGE_DATE >= DATEADD(day, -{days}, CURRENT_TIMESTAMP)"
+        
+        # Final query - no GROUP BY needed for daily usage table
+        query = f"""
+        SELECT {', '.join(select_parts)}
+        FROM {table}
+        WHERE {time_filter}
+        ORDER BY USAGE_DATE DESC
+        LIMIT 5000
+        """
+        
+        return session.sql(query).to_pandas()
+        
+    except Exception as e:
+        st.error(f"Error fetching Cortex Search data: {str(e)}")
+        # Log available columns for debugging
+        if 'cortex_search' in table_info and table_info['cortex_search']['columns']:
+            st.info(f"Available columns: {', '.join(table_info['cortex_search']['columns'])}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=3600)
+def get_simple_usage_data():
+    """Fallback to original simple query if advanced detection fails"""
+    try:
+        if days_to_fetch == 1:
+            query = f"""
+            SELECT
+              DATE_TRUNC('DAY', START_TIME) AS USAGE_DATE,
+              FUNCTION_NAME,
+              MODEL_NAME,
+              SUM(TOKENS) AS TOTAL_TOKENS,
+              SUM(TOKEN_CREDITS) AS TOTAL_CREDITS,
+              COUNT(*) AS TOTAL_REQUESTS
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FUNCTIONS_USAGE_HISTORY
+            WHERE START_TIME >= DATE_TRUNC('DAY', CURRENT_TIMESTAMP)
+            GROUP BY USAGE_DATE, FUNCTION_NAME, MODEL_NAME
+            ORDER BY USAGE_DATE DESC, TOTAL_CREDITS DESC
+            LIMIT 5000
+            """
+        else:
+            query = f"""
+            SELECT
+              DATE_TRUNC('DAY', START_TIME) AS USAGE_DATE,
+              FUNCTION_NAME,
+              MODEL_NAME,
+              SUM(TOKENS) AS TOTAL_TOKENS,
+              SUM(TOKEN_CREDITS) AS TOTAL_CREDITS,
+              COUNT(*) AS TOTAL_REQUESTS
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FUNCTIONS_USAGE_HISTORY
+            WHERE START_TIME >= DATEADD(day, -{days_to_fetch}, CURRENT_TIMESTAMP)
+            GROUP BY USAGE_DATE, FUNCTION_NAME, MODEL_NAME
+            ORDER BY USAGE_DATE DESC, TOTAL_CREDITS DESC
+            LIMIT 5000
+            """
+        
+        return session.sql(query).to_pandas()
+        
+    except Exception as e:
+        st.error(f"Error with simple query: {str(e)}")
+        return pd.DataFrame()
+
+# Helper functions
+def format_currency(value):
+    return f"${value:,.2f}"
+
+def format_number(value):
+    if pd.isna(value):
+        return "0"
+    return f"{value:,.0f}"
+
+def safe_get_column_values(df, column_name):
+    """Safely get unique values from a column"""
+    if df.empty or column_name not in df.columns:
+        return []
+    return df[column_name].dropna().unique().tolist()
+
+# Load data with progress tracking
+with st.spinner("Loading AI/ML data..."):
+    progress_bar = st.progress(0)
+    
+    # Try advanced detection first, fallback to simple query
+    df_functions = get_cortex_functions_data(days_to_fetch)
+    
+    if df_functions.empty:
+        st.info("Advanced detection failed, trying simple approach...")
+        df_functions = get_simple_usage_data()
+    
+    progress_bar.progress(33)
+    
+    # Load Cortex Analyst data
+    df_analyst = get_cortex_analyst_data(days_to_fetch)
+    progress_bar.progress(66)
+    
+    # Load Cortex Search data
+    df_search = get_cortex_search_data(days_to_fetch)
+    progress_bar.progress(100)
+    progress_bar.empty()
+
+# Check if we have any data
+if df_functions.empty and df_analyst.empty and df_search.empty:
+    st.error(f"""
+    **No AI/ML usage data found for {date_range}.**
+    
+    **Possible reasons:**
+    - No Cortex AI/ML services have been used in this time period
+    - Account doesn't have access to ACCOUNT_USAGE views
+    - Data retention period has been exceeded
+    - Tables may not exist in your Snowflake edition
+    
+    **Troubleshooting:**
+    1. Try a longer date range (Last 30 days)
+    2. Check with your Snowflake administrator about ACCOUNT_USAGE permissions
+    3. Verify that Cortex functions have been used recently
+    4. Check if your Snowflake edition supports these usage tables
+    """)
+    st.stop()
+
+# Add TOTAL_SPEND columns
+if not df_functions.empty and 'TOTAL_CREDITS' in df_functions.columns:
+    df_functions['TOTAL_SPEND'] = df_functions['TOTAL_CREDITS'] * price_per_credit
+
+if not df_analyst.empty and 'TOTAL_CREDITS' in df_analyst.columns:
+    df_analyst['TOTAL_SPEND'] = df_analyst['TOTAL_CREDITS'] * price_per_credit
+
+if not df_search.empty and 'TOTAL_CREDITS' in df_search.columns:
+    df_search['TOTAL_SPEND'] = df_search['TOTAL_CREDITS'] * price_per_credit
+
+# Convert date columns
+if not df_functions.empty and 'USAGE_DATE' in df_functions.columns:
+    df_functions['USAGE_DATE'] = pd.to_datetime(df_functions['USAGE_DATE'])
+
+if not df_analyst.empty and 'USAGE_DATE' in df_analyst.columns:
+    df_analyst['USAGE_DATE'] = pd.to_datetime(df_analyst['USAGE_DATE'])
+
+if not df_search.empty and 'USAGE_DATE' in df_search.columns:
+    df_search['USAGE_DATE'] = pd.to_datetime(df_search['USAGE_DATE'])
+
+# Create tabs
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📊 Overview", 
+    "🧠 Cortex Analyst",
+    "🔎 Cortex Search",
+    "📋 Raw Data"
+])
+
+with tab1:
+    st.header("💰 Cost Overview & Key Metrics")
+    
+    # Calculate combined metrics
+    total_credits = 0
+    total_tokens = 0
+    total_requests = 0
+    
+    if not df_functions.empty:
+        total_credits += df_functions['TOTAL_CREDITS'].sum() if 'TOTAL_CREDITS' in df_functions.columns else 0
+        total_tokens += df_functions['TOTAL_TOKENS'].sum() if 'TOTAL_TOKENS' in df_functions.columns else 0
+        total_requests += df_functions['TOTAL_REQUESTS'].sum() if 'TOTAL_REQUESTS' in df_functions.columns else 0
+    
+    if not df_analyst.empty:
+        total_credits += df_analyst['TOTAL_CREDITS'].sum() if 'TOTAL_CREDITS' in df_analyst.columns else 0
+        total_tokens += df_analyst['TOTAL_TOKENS'].sum() if 'TOTAL_TOKENS' in df_analyst.columns else 0
+        total_requests += df_analyst['TOTAL_QUERIES'].sum() if 'TOTAL_QUERIES' in df_analyst.columns else 0
+    
+    if not df_search.empty:
+        total_credits += df_search['TOTAL_CREDITS'].sum() if 'TOTAL_CREDITS' in df_search.columns else 0
+        total_requests += df_search['SEARCH_REQUEST_COUNT'].sum() if 'SEARCH_REQUEST_COUNT' in df_search.columns else 0
+    
+    total_spend = total_credits * price_per_credit
+    
+    # Calculate daily averages
+    all_dates = pd.concat([
+        df_functions['USAGE_DATE'] if not df_functions.empty and 'USAGE_DATE' in df_functions.columns else pd.Series(),
+        df_analyst['USAGE_DATE'] if not df_analyst.empty and 'USAGE_DATE' in df_analyst.columns else pd.Series(),
+        df_search['USAGE_DATE'] if not df_search.empty and 'USAGE_DATE' in df_search.columns else pd.Series()
+    ]).dt.date.nunique()
+    
+    unique_dates = max(all_dates, 1)
+    avg_daily_credits = total_credits / unique_dates
+    avg_daily_spend = total_spend / unique_dates
+    
+    # Top metrics cards - first row
+    cols = st.columns(4)
+    
+    with cols[0]:
+        st.metric(
+            "💰 Total Spend",
+            format_currency(total_spend),
+            delta=f"${avg_daily_spend:.2f}/day avg"
+        )
+    
+    with cols[1]:
+        st.metric(
+            "⚡ Total Credits",
+            f"{total_credits:.1f}",
+            delta=f"{avg_daily_credits:.1f}/day avg"
+        )
+    
+    with cols[2]:
+        st.metric(
+            "🔢 Total Tokens", 
+            format_number(total_tokens)
+        )
+    
+    with cols[3]:
+        st.metric(
+            "📊 Total Requests",
+            format_number(total_requests)
+        )
+    
+    # Second row of metrics
+    cols2 = st.columns(4)
+    
+    with cols2[0]:
+        # Projected monthly cost based on daily average
+        projected_monthly = avg_daily_spend * 30
+        projection_note = "Based on current daily average"
+        if unique_dates == 1:
+            projection_note = "Based on 1 day of data"
+        elif unique_dates < 7:
+            projection_note = f"Based on {unique_dates} days of data"
+        
+        st.metric(
+            "📈 Projected Monthly",
+            format_currency(projected_monthly),
+            help=projection_note
+        )
+    
+    with cols2[1]:
+        # Cost per 1M tokens
+        if total_tokens > 0:
+            cost_per_million_tokens = (total_spend / total_tokens) * 1_000_000
+            st.metric(
+                "💵 Cost per 1M Tokens",
+                format_currency(cost_per_million_tokens)
+            )
+        else:
+            st.metric(
+                "💵 Cost per 1M Tokens",
+                "N/A"
+            )
+    
+    with cols2[2]:
+        # Most used model
+        model_found = False
+        
+        if not df_functions.empty and 'MODEL_NAME' in df_functions.columns and 'TOTAL_REQUESTS' in df_functions.columns:
+            model_usage = df_functions.groupby('MODEL_NAME')['TOTAL_REQUESTS'].sum()
+            if not model_usage.empty:
+                top_model = model_usage.idxmax()
+                st.metric("🏆 Top Model", top_model)
+                model_found = True
+        
+        if not model_found and not df_analyst.empty and 'MODEL_NAME' in df_analyst.columns and 'TOTAL_QUERIES' in df_analyst.columns:
+            model_usage = df_analyst.groupby('MODEL_NAME')['TOTAL_QUERIES'].sum()
+            if not model_usage.empty:
+                top_model = model_usage.idxmax()
+                st.metric("🏆 Top Model", top_model)
+                model_found = True
+        
+        if not model_found:
+            st.metric("🏆 Top Model", "N/A")
+    
+    with cols2[3]:
+        # Service diversity
+        active_services = sum([
+            1 if not df_functions.empty else 0,
+            1 if not df_analyst.empty else 0,
+            1 if not df_search.empty else 0
+        ])
+        st.metric(
+            "🔧 Active Services",
+            f"{active_services} of 3"
+        )
+    
+    # Service breakdown
+    st.subheader("📊 Service Usage Breakdown")
+    service_data = []
+    
+    if not df_functions.empty and 'TOTAL_CREDITS' in df_functions.columns:
+        service_data.append({
+            'Service': 'Cortex Functions',
+            'Credits': df_functions['TOTAL_CREDITS'].sum(),
+            'Spend': df_functions['TOTAL_CREDITS'].sum() * price_per_credit
+        })
+    
+    if not df_analyst.empty and 'TOTAL_CREDITS' in df_analyst.columns:
+        service_data.append({
+            'Service': 'Cortex Analyst',
+            'Credits': df_analyst['TOTAL_CREDITS'].sum(),
+            'Spend': df_analyst['TOTAL_CREDITS'].sum() * price_per_credit
+        })
+    
+    if not df_search.empty and 'TOTAL_CREDITS' in df_search.columns:
+        service_data.append({
+            'Service': 'Cortex Search',
+            'Credits': df_search['TOTAL_CREDITS'].sum(),
+            'Spend': df_search['TOTAL_CREDITS'].sum() * price_per_credit
+        })
+    
+    if service_data:
+        service_df = pd.DataFrame(service_data)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            chart = alt.Chart(service_df).mark_arc().encode(
+                theta=alt.Theta('Credits:Q'),
+                color=alt.Color('Service:N'),
+                tooltip=['Service:N', 'Credits:Q', 'Spend:Q']
+            ).properties(
+                title="Credits by Service",
+                height=300
+            )
+            st.altair_chart(chart, use_container_width=True)
+        
+        with col2:
+            chart = alt.Chart(service_df).mark_bar().encode(
+                x=alt.X('Spend:Q', title='Spend ($)'),
+                y=alt.Y('Service:N', title='Service'),
+                color=alt.Color('Service:N'),
+                tooltip=['Service:N', 'Spend:Q', 'Credits:Q']
+            ).properties(
+                title="Spend by Service",
+                height=300
+            )
+            st.altair_chart(chart, use_container_width=True)
+    
+    # Combined daily spend trend
+    st.subheader("💹 Daily Spend Trends")
+    
+    daily_data = []
+    
+    if not df_functions.empty and 'USAGE_DATE' in df_functions.columns and 'TOTAL_SPEND' in df_functions.columns:
+        daily_functions = df_functions.groupby('USAGE_DATE')['TOTAL_SPEND'].sum().reset_index()
+        daily_functions['Service'] = 'Cortex Functions'
+        daily_data.append(daily_functions)
+    
+    if not df_analyst.empty and 'USAGE_DATE' in df_analyst.columns and 'TOTAL_SPEND' in df_analyst.columns:
+        daily_analyst = df_analyst.groupby('USAGE_DATE')['TOTAL_SPEND'].sum().reset_index()
+        daily_analyst['Service'] = 'Cortex Analyst'
+        daily_data.append(daily_analyst)
+    
+    if not df_search.empty and 'USAGE_DATE' in df_search.columns and 'TOTAL_SPEND' in df_search.columns:
+        daily_search = df_search.groupby('USAGE_DATE')['TOTAL_SPEND'].sum().reset_index()
+        daily_search['Service'] = 'Cortex Search'
+        daily_data.append(daily_search)
+    
+    if daily_data:
+        combined_daily = pd.concat(daily_data, ignore_index=True)
+        
+        # Create stacked area chart for spend trends
+        chart = alt.Chart(combined_daily).mark_area(opacity=0.7).encode(
+            x=alt.X('USAGE_DATE:T', title='Date'),
+            y=alt.Y('TOTAL_SPEND:Q', title='Spend ($)', stack='zero'),
+            color=alt.Color('Service:N', scale=alt.Scale(scheme='tableau10')),
+            tooltip=['USAGE_DATE:T', 'Service:N', 'TOTAL_SPEND:Q']
+        ).properties(
+            title="Daily Spend by Service (Stacked)",
+            height=350
+        )
+        st.altair_chart(chart, use_container_width=True)
+    else:
+        st.info("No daily spend data available to display trends")
+    
+    # Top models and usage patterns
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Top models across all services
+        st.subheader("🏆 Top Models by Credits")
+        
+        model_data = []
+        
+        if not df_functions.empty and 'MODEL_NAME' in df_functions.columns and 'TOTAL_CREDITS' in df_functions.columns:
+            func_models = df_functions.groupby('MODEL_NAME')['TOTAL_CREDITS'].sum().reset_index()
+            func_models['Service'] = 'Functions'
+            model_data.append(func_models)
+        
+        if not df_analyst.empty and 'MODEL_NAME' in df_analyst.columns and 'TOTAL_CREDITS' in df_analyst.columns:
+            analyst_models = df_analyst.groupby('MODEL_NAME')['TOTAL_CREDITS'].sum().reset_index()
+            analyst_models['Service'] = 'Analyst'
+            model_data.append(analyst_models)
+        
+        if model_data:
+            combined_models = pd.concat(model_data, ignore_index=True)
+            top_models = combined_models.groupby('MODEL_NAME')['TOTAL_CREDITS'].sum().reset_index().nlargest(7, 'TOTAL_CREDITS')
+            
+            chart = alt.Chart(top_models).mark_bar().encode(
+                x=alt.X('TOTAL_CREDITS:Q', title='Total Credits'),
+                y=alt.Y('MODEL_NAME:N', title='Model', sort='-x'),
+                color=alt.Color('TOTAL_CREDITS:Q', scale=alt.Scale(scheme='oranges')),
+                tooltip=['MODEL_NAME:N', 'TOTAL_CREDITS:Q']
+            ).properties(
+                height=300
+            )
+            st.altair_chart(chart, use_container_width=True)
+    
+    with col2:
+        # Credit usage growth rate
+        st.subheader("📈 Daily Growth Rate")
+        
+        all_daily = []
+        
+        if not df_functions.empty and 'USAGE_DATE' in df_functions.columns and 'TOTAL_CREDITS' in df_functions.columns:
+            func_daily = df_functions.groupby('USAGE_DATE')['TOTAL_CREDITS'].sum()
+            all_daily.append(func_daily)
+        
+        if not df_analyst.empty and 'USAGE_DATE' in df_analyst.columns and 'TOTAL_CREDITS' in df_analyst.columns:
+            analyst_daily = df_analyst.groupby('USAGE_DATE')['TOTAL_CREDITS'].sum()
+            all_daily.append(analyst_daily)
+        
+        if not df_search.empty and 'USAGE_DATE' in df_search.columns and 'TOTAL_CREDITS' in df_search.columns:
+            search_daily = df_search.groupby('USAGE_DATE')['TOTAL_CREDITS'].sum()
+            all_daily.append(search_daily)
+        
+        if all_daily:
+            total_daily = pd.concat(all_daily).groupby(level=0).sum().reset_index()
+            total_daily.columns = ['Date', 'Credits']
+            total_daily = total_daily.sort_values('Date')
+            
+            # Calculate percentage change
+            total_daily['Growth_Rate'] = total_daily['Credits'].pct_change() * 100
+            
+            # Create dual-axis chart
+            base = alt.Chart(total_daily).encode(x='Date:T')
+            
+            line = base.mark_line(color='steelblue').encode(
+                y=alt.Y('Credits:Q', title='Total Credits', axis=alt.Axis(titleColor='steelblue'))
+            )
+            
+            bar = base.mark_bar(opacity=0.5).encode(
+                y=alt.Y('Growth_Rate:Q', title='Growth Rate (%)', axis=alt.Axis(titleColor='green')),
+                color=alt.condition(
+                    alt.datum.Growth_Rate > 0,
+                    alt.value('lightgreen'),
+                    alt.value('lightcoral')
+                )
+            )
+            
+            chart = alt.layer(line, bar).resolve_scale(y='independent').properties(
+                height=300,
+                title="Credits Usage & Growth Rate"
+            )
+            st.altair_chart(chart, use_container_width=True)
+    
+    # Function usage breakdown (if available)
+    if not df_functions.empty and 'FUNCTION_NAME' in df_functions.columns:
+        st.subheader("⚡ Top Functions by Usage")
+        
+        # Build aggregation dict based on available columns
+        agg_dict = {}
+        if 'TOTAL_CREDITS' in df_functions.columns:
+            agg_dict['TOTAL_CREDITS'] = 'sum'
+        if 'TOTAL_REQUESTS' in df_functions.columns:
+            agg_dict['TOTAL_REQUESTS'] = 'sum'
+        
+        if agg_dict:
+            func_summary = df_functions.groupby('FUNCTION_NAME').agg(agg_dict).reset_index()
+            
+            if 'TOTAL_CREDITS' in func_summary.columns:
+                func_summary = func_summary.nlargest(10, 'TOTAL_CREDITS')
+                func_summary['TOTAL_SPEND'] = func_summary['TOTAL_CREDITS'] * price_per_credit
+                
+                # Build tooltip list
+                tooltip_list = [
+                    alt.Tooltip('FUNCTION_NAME:N', title='Function'),
+                    alt.Tooltip('TOTAL_SPEND:Q', title='Spend', format='$,.2f'),
+                    alt.Tooltip('TOTAL_CREDITS:Q', title='Credits', format=',.1f')
+                ]
+                if 'TOTAL_REQUESTS' in func_summary.columns:
+                    tooltip_list.append(alt.Tooltip('TOTAL_REQUESTS:Q', title='Requests', format=','))
+                
+                # Create horizontal bar chart
+                chart = alt.Chart(func_summary).mark_bar(orient='horizontal').encode(
+                    y=alt.Y('FUNCTION_NAME:N', title='Function', sort='-x'),
+                    x=alt.X('TOTAL_SPEND:Q', title='Total Spend ($)'),
+                    color=alt.Color('TOTAL_CREDITS:Q', scale=alt.Scale(scheme='tealblues'), legend=None),
+                    tooltip=tooltip_list
+                ).properties(
+                    height=400
+                )
+                
+                st.altair_chart(chart, use_container_width=True)
+    
+    # Additional insights section
+    st.subheader("🎯 Key Insights & Efficiency Metrics")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        # Average cost per request
+        if total_requests > 0:
+            avg_cost_per_request = total_spend / total_requests
+            st.metric(
+                "💵 Avg Cost per Request",
+                format_currency(avg_cost_per_request)
+            )
+        else:
+            st.metric(
+                "💵 Avg Cost per Request",
+                "N/A"
+            )
+    
+    with col2:
+        # Average tokens per request
+        if total_requests > 0 and total_tokens > 0:
+            avg_tokens_per_request = total_tokens / total_requests
+            st.metric(
+                "📝 Avg Tokens per Request",
+                f"{avg_tokens_per_request:.0f}"
+            )
+        else:
+            st.metric(
+                "📝 Avg Tokens per Request",
+                "N/A"
+            )
+    
+    with col3:
+        # Most expensive day
+        all_daily_spend = []
+        if not df_functions.empty and 'USAGE_DATE' in df_functions.columns and 'TOTAL_SPEND' in df_functions.columns:
+            all_daily_spend.append(df_functions.groupby('USAGE_DATE')['TOTAL_SPEND'].sum())
+        if not df_analyst.empty and 'USAGE_DATE' in df_analyst.columns and 'TOTAL_SPEND' in df_analyst.columns:
+            all_daily_spend.append(df_analyst.groupby('USAGE_DATE')['TOTAL_SPEND'].sum())
+        if not df_search.empty and 'USAGE_DATE' in df_search.columns and 'TOTAL_SPEND' in df_search.columns:
+            all_daily_spend.append(df_search.groupby('USAGE_DATE')['TOTAL_SPEND'].sum())
+        
+        if all_daily_spend:
+            combined_daily_spend = pd.concat(all_daily_spend).groupby(level=0).sum()
+            if not combined_daily_spend.empty:
+                max_spend_date = combined_daily_spend.idxmax()
+                max_spend_amount = combined_daily_spend.max()
+                st.metric(
+                    "📅 Peak Spend Day",
+                    max_spend_date.strftime('%Y-%m-%d'),
+                    delta=format_currency(max_spend_amount)
+                )
+            else:
+                st.metric("📅 Peak Spend Day", "N/A")
+        else:
+            st.metric("📅 Peak Spend Day", "N/A")
+    
+    # Service comparison table
+    st.subheader("📊 Service Comparison Summary")
+    
+    comparison_data = []
+    
+    if not df_functions.empty:
+        credits = df_functions['TOTAL_CREDITS'].sum() if 'TOTAL_CREDITS' in df_functions.columns else 0
+        comparison_data.append({
+            'Service': 'Cortex Functions',
+            'Total Credits': f"{credits:.1f}",
+            'Total Spend': format_currency(df_functions['TOTAL_SPEND'].sum() if 'TOTAL_SPEND' in df_functions.columns else 0),
+            'Total Requests': format_number(df_functions['TOTAL_REQUESTS'].sum() if 'TOTAL_REQUESTS' in df_functions.columns else 0),
+            'Unique Models': df_functions['MODEL_NAME'].nunique() if 'MODEL_NAME' in df_functions.columns else 0,
+            'Active Days': df_functions['USAGE_DATE'].dt.date.nunique() if 'USAGE_DATE' in df_functions.columns else 0
+        })
+    
+    if not df_analyst.empty:
+        credits = df_analyst['TOTAL_CREDITS'].sum() if 'TOTAL_CREDITS' in df_analyst.columns else 0
+        comparison_data.append({
+            'Service': 'Cortex Analyst',
+            'Total Credits': f"{credits:.1f}",
+            'Total Spend': format_currency(df_analyst['TOTAL_SPEND'].sum() if 'TOTAL_SPEND' in df_analyst.columns else 0),
+            'Total Requests': format_number(df_analyst['TOTAL_QUERIES'].sum() if 'TOTAL_QUERIES' in df_analyst.columns else 0),
+            'Unique Models': df_analyst['MODEL_NAME'].nunique() if 'MODEL_NAME' in df_analyst.columns else 0,
+            'Active Days': df_analyst['USAGE_DATE'].dt.date.nunique() if 'USAGE_DATE' in df_analyst.columns else 0
+        })
+    
+    if not df_search.empty:
+        credits = df_search['TOTAL_CREDITS'].sum() if 'TOTAL_CREDITS' in df_search.columns else 0
+        comparison_data.append({
+            'Service': 'Cortex Search',
+            'Total Credits': f"{credits:.1f}",
+            'Total Spend': format_currency(df_search['TOTAL_SPEND'].sum() if 'TOTAL_SPEND' in df_search.columns else 0),
+            'Total Requests': format_number(df_search['SEARCH_REQUEST_COUNT'].sum() if 'SEARCH_REQUEST_COUNT' in df_search.columns else 0),
+            'Unique Models': 'N/A',  # Search doesn't use models
+            'Active Days': df_search['USAGE_DATE'].dt.date.nunique() if 'USAGE_DATE' in df_search.columns else 0
+        })
+    
+    if comparison_data:
+        comparison_df = pd.DataFrame(comparison_data)
+        st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+    
+    # Trend Analysis
+    st.subheader("📈 Usage Patterns & Trends")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Show current period summary
+        st.markdown("**Current Period Summary:**")
+        
+        # Functions summary
+        if not df_functions.empty and 'TOTAL_SPEND' in df_functions.columns:
+            func_total = df_functions['TOTAL_SPEND'].sum()
+            func_days = df_functions['USAGE_DATE'].dt.date.nunique() if 'USAGE_DATE' in df_functions.columns else 1
+            st.metric(
+                "Cortex Functions",
+                format_currency(func_total),
+                delta=f"{format_currency(func_total/max(func_days, 1))}/day"
+            )
+        
+        # Analyst summary
+        if not df_analyst.empty and 'TOTAL_SPEND' in df_analyst.columns:
+            analyst_total = df_analyst['TOTAL_SPEND'].sum()
+            analyst_days = df_analyst['USAGE_DATE'].dt.date.nunique() if 'USAGE_DATE' in df_analyst.columns else 1
+            st.metric(
+                "Cortex Analyst",
+                format_currency(analyst_total),
+                delta=f"{format_currency(analyst_total/max(analyst_days, 1))}/day"
+            )
+        
+        # Search summary
+        if not df_search.empty and 'TOTAL_SPEND' in df_search.columns:
+            search_total = df_search['TOTAL_SPEND'].sum()
+            search_days = df_search['USAGE_DATE'].dt.date.nunique() if 'USAGE_DATE' in df_search.columns else 1
+            st.metric(
+                "Cortex Search",
+                format_currency(search_total),
+                delta=f"{format_currency(search_total/max(search_days, 1))}/day"
+            )
+    
+    with col2:
+        # Average daily spend by day of week
+        dow_data = []
+        
+        for df, service in [(df_functions, 'Functions'), (df_analyst, 'Analyst'), (df_search, 'Search')]:
+            if not df.empty and 'USAGE_DATE' in df.columns and 'TOTAL_SPEND' in df.columns:
+                dow_df = df.copy()
+                dow_df['DayOfWeek'] = dow_df['USAGE_DATE'].dt.day_name()
+                dow_summary = dow_df.groupby('DayOfWeek')['TOTAL_SPEND'].mean().reset_index()
+                dow_summary['Service'] = service
+                dow_data.append(dow_summary)
+        
+        if dow_data:
+            dow_combined = pd.concat(dow_data)
+            
+            # Order days properly
+            day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+            dow_combined['DayOfWeek'] = pd.Categorical(dow_combined['DayOfWeek'], categories=day_order, ordered=True)
+            
+            chart = alt.Chart(dow_combined).mark_bar().encode(
+                x=alt.X('DayOfWeek:O', title='Day of Week', sort=day_order),
+                y=alt.Y('TOTAL_SPEND:Q', title='Average Spend ($)'),
+                color='Service:N',
+                tooltip=['DayOfWeek:O', 'Service:N', alt.Tooltip('TOTAL_SPEND:Q', format='$,.2f')]
+            ).properties(
+                title="Average Spend by Day of Week",
+                height=300
+            )
+            st.altair_chart(chart, use_container_width=True)
+        else:
+            st.info("Day-of-week analysis requires data from multiple days. Try selecting a longer date range.")
+    
+    # Function Performance and Token Efficiency Analysis
+    if not df_functions.empty and 'FUNCTION_NAME' in df_functions.columns:
+        st.subheader("🔍 Detailed Function Analysis")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Function Performance**")
+            func_perf = df_functions.groupby('FUNCTION_NAME').agg({
+                'TOTAL_CREDITS': 'sum',
+                'TOTAL_REQUESTS': 'sum',
+                'TOTAL_TOKENS': 'sum' if 'TOTAL_TOKENS' in df_functions.columns else 'count'
+            }).reset_index()
+            
+            chart = alt.Chart(func_perf).mark_bar().encode(
+                x=alt.X('TOTAL_CREDITS:Q', title='Total Credits'),
+                y=alt.Y('FUNCTION_NAME:N', title='Function', sort='-x'),
+                color=alt.Color('TOTAL_CREDITS:Q', scale=alt.Scale(scheme='blues')),
+                tooltip=['FUNCTION_NAME:N', 'TOTAL_CREDITS:Q', 'TOTAL_REQUESTS:Q']
+            ).properties(height=350)
+            
+            st.altair_chart(chart, use_container_width=True)
+        
+        with col2:
+            if 'TOTAL_TOKENS' in df_functions.columns and 'MODEL_NAME' in df_functions.columns:
+                st.markdown("**Token Efficiency by Model**")
+                model_eff = df_functions.groupby('MODEL_NAME').agg({
+                    'TOTAL_TOKENS': 'sum',
+                    'TOTAL_CREDITS': 'sum'
+                }).reset_index()
+                model_eff['TOKENS_PER_CREDIT'] = model_eff['TOTAL_TOKENS'] / model_eff['TOTAL_CREDITS']
+                model_eff = model_eff.sort_values('TOKENS_PER_CREDIT', ascending=False)
+                
+                chart = alt.Chart(model_eff).mark_bar().encode(
+                    x=alt.X('TOKENS_PER_CREDIT:Q', title='Tokens per Credit'),
+                    y=alt.Y('MODEL_NAME:N', title='Model', sort='-x'),
+                    color=alt.Color('TOKENS_PER_CREDIT:Q', scale=alt.Scale(scheme='viridis')),
+                    tooltip=['MODEL_NAME:N', 'TOKENS_PER_CREDIT:Q', 'TOTAL_TOKENS:Q', 'TOTAL_CREDITS:Q']
+                ).properties(height=350)
+                
+                st.altair_chart(chart, use_container_width=True)
+            else:
+                st.info("Token efficiency analysis requires token data")
+    
+    # Overview tab footer
+    st.markdown("---")
+    st.markdown(f"""
+    ### 📊 Overview Dashboard Information:
+    - **Date Range**: {date_range} {"(today since midnight)" if days_to_fetch == 1 else ""}
+    - **Current Pricing**: ${price_per_credit:.2f} per credit
+    - **Data Sources Combined**: All Cortex services (Functions, Analyst, Search)
+    - **Last Refreshed**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    - **Total Records Analyzed**: {len(df_functions) + len(df_analyst) + len(df_search):,}
+    """)
+
+with tab2:
+    st.header("🧠 Cortex Analyst Usage")
+    
+    if not df_analyst.empty:
+        # Debug info to help understand schema
+        with st.expander("🔧 Debug: Available Cortex Analyst Columns"):
+            st.write(f"Columns in dataset: {', '.join(df_analyst.columns.tolist())}")
+        
+        # Metrics
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            analyst_credits = df_analyst['TOTAL_CREDITS'].sum() if 'TOTAL_CREDITS' in df_analyst.columns else 0
+            st.metric("⚡ Total Credits", f"{analyst_credits:.1f}")
+        
+        with col2:
+            analyst_spend = analyst_credits * price_per_credit
+            st.metric("💰 Total Spend", format_currency(analyst_spend))
+        
+        with col3:
+            analyst_queries = df_analyst['TOTAL_QUERIES'].sum() if 'TOTAL_QUERIES' in df_analyst.columns else 0
+            st.metric("🔍 Total Queries", format_number(analyst_queries))
+        
+        with col4:
+            analyst_tokens = df_analyst['TOTAL_TOKENS'].sum() if 'TOTAL_TOKENS' in df_analyst.columns else 0
+            st.metric("🔢 Total Tokens", format_number(analyst_tokens))
+        
+        # Service usage - dynamically find service name column
+        st.subheader("📊 Analyst Service Usage")
+        
+        # Find the service name column
+        service_col = None
+        for col in ['SERVICE_NAME', 'SERVICE_ID', 'CORTEX_ANALYST_SERVICE_NAME']:
+            if col in df_analyst.columns:
+                service_col = col
+                break
+        
+        if service_col:
+            # Build aggregation dict based on available columns
+            agg_dict = {}
+            if 'TOTAL_CREDITS' in df_analyst.columns:
+                agg_dict['TOTAL_CREDITS'] = 'sum'
+            if 'TOTAL_QUERIES' in df_analyst.columns:
+                agg_dict['TOTAL_QUERIES'] = 'sum'
+            if 'TOTAL_TOKENS' in df_analyst.columns:
+                agg_dict['TOTAL_TOKENS'] = 'sum'
+            
+            # Only aggregate if we have columns to aggregate
+            if agg_dict:
+                service_usage = df_analyst.groupby(service_col).agg(agg_dict).reset_index()
+            else:
+                # If no aggregation columns, just count rows per service
+                service_usage = df_analyst.groupby(service_col).size().reset_index(name='COUNT')
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if not service_usage.empty:
+                    if 'TOTAL_CREDITS' in service_usage.columns:
+                        chart = alt.Chart(service_usage).mark_bar().encode(
+                            x=alt.X('TOTAL_CREDITS:Q', title='Total Credits'),
+                            y=alt.Y(f'{service_col}:N', title='Service', sort='-x'),
+                            color=alt.Color('TOTAL_CREDITS:Q', scale=alt.Scale(scheme='blues')),
+                            tooltip=[f'{service_col}:N', 'TOTAL_CREDITS:Q'] + 
+                                   (['TOTAL_QUERIES:Q'] if 'TOTAL_QUERIES' in service_usage.columns else [])
+                        ).properties(
+                            title="Credits by Analyst Service",
+                            height=300
+                        )
+                    elif 'TOTAL_QUERIES' in service_usage.columns:
+                        chart = alt.Chart(service_usage).mark_bar().encode(
+                            x=alt.X('TOTAL_QUERIES:Q', title='Total Queries'),
+                            y=alt.Y(f'{service_col}:N', title='Service', sort='-x'),
+                            color=alt.Color('TOTAL_QUERIES:Q', scale=alt.Scale(scheme='blues')),
+                            tooltip=[f'{service_col}:N', 'TOTAL_QUERIES:Q']
+                        ).properties(
+                            title="Queries by Analyst Service",
+                            height=300
+                        )
+                    else:
+                        chart = alt.Chart(service_usage).mark_bar().encode(
+                            x=alt.X('COUNT:Q', title='Record Count'),
+                            y=alt.Y(f'{service_col}:N', title='Service', sort='-x'),
+                            color=alt.Color('COUNT:Q', scale=alt.Scale(scheme='blues')),
+                            tooltip=[f'{service_col}:N', 'COUNT:Q']
+                        ).properties(
+                            title="Activity by Analyst Service",
+                            height=300
+                        )
+                    st.altair_chart(chart, use_container_width=True)
+                else:
+                    st.info("No service usage data to display")
+            
+            with col2:
+                # Model distribution
+                if 'MODEL_NAME' in df_analyst.columns and 'TOTAL_CREDITS' in df_analyst.columns:
+                    model_dist = df_analyst.groupby('MODEL_NAME')['TOTAL_CREDITS'].sum().reset_index()
+                    
+                    chart = alt.Chart(model_dist).mark_arc().encode(
+                        theta=alt.Theta('TOTAL_CREDITS:Q'),
+                        color=alt.Color('MODEL_NAME:N'),
+                        tooltip=['MODEL_NAME:N', 'TOTAL_CREDITS:Q']
+                    ).properties(
+                        title="Model Usage Distribution",
+                        height=300
+                    )
+                    st.altair_chart(chart, use_container_width=True)
+        
+        # Token breakdown
+        if 'TOTAL_INPUT_TOKENS' in df_analyst.columns and 'TOTAL_OUTPUT_TOKENS' in df_analyst.columns:
+            st.subheader("📝 Token Usage Breakdown")
+            
+            token_data = pd.DataFrame({
+                'Token Type': ['Input Tokens', 'Output Tokens'],
+                'Count': [
+                    df_analyst['TOTAL_INPUT_TOKENS'].sum(),
+                    df_analyst['TOTAL_OUTPUT_TOKENS'].sum()
+                ]
+            })
+            
+            chart = alt.Chart(token_data).mark_arc().encode(
+                theta=alt.Theta('Count:Q'),
+                color=alt.Color('Token Type:N'),
+                tooltip=['Token Type:N', 'Count:Q']
+            ).properties(
+                title="Input vs Output Tokens",
+                height=300
+            )
+            st.altair_chart(chart, use_container_width=True)
+    else:
+        st.info("No Cortex Analyst data available for the selected period")
+        if 'cortex_analyst' in table_info and table_info['cortex_analyst']['available']:
+            st.warning("Data was fetched but may be missing expected columns. Check the debug expander above for available columns.")
+    
+    # Tab-specific footer
+    st.markdown("---")
+    st.markdown(f"""
+    ### 🧠 Cortex Analyst Information:
+    - **Date Range**: {date_range}
+    - **Data Source**: SNOWFLAKE.ACCOUNT_USAGE.CORTEX_ANALYST_USAGE_HISTORY
+    - **Records Loaded**: {len(df_analyst):,}
+    - **Last Refreshed**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    """)
+
+with tab3:
+    st.header("🔎 Cortex Search Usage")
+    
+    if not df_search.empty:
+        # Debug info to help understand schema
+        with st.expander("🔧 Debug: Available Cortex Search Columns"):
+            st.write(f"Columns in dataset: {', '.join(df_search.columns.tolist())}")
+        
+        # Metrics
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            search_credits = df_search['TOTAL_CREDITS'].sum() if 'TOTAL_CREDITS' in df_search.columns else 0
+            st.metric("⚡ Total Credits", f"{search_credits:.1f}")
+        
+        with col2:
+            search_spend = search_credits * price_per_credit
+            st.metric("💰 Total Spend", format_currency(search_spend))
+        
+        with col3:
+            search_requests = df_search['SEARCH_REQUEST_COUNT'].sum() if 'SEARCH_REQUEST_COUNT' in df_search.columns else 0
+            st.metric("🔍 Search Requests", format_number(search_requests))
+        
+        with col4:
+            search_results = df_search['SEARCH_RESULT_RANK_COUNT'].sum() if 'SEARCH_RESULT_RANK_COUNT' in df_search.columns else 0
+            st.metric("📊 Results Ranked", format_number(search_results))
+        
+        # Service usage - dynamically find service name column
+        st.subheader("📊 Search Service Usage")
+        
+        # Find the service name column
+        service_col = None
+        for col in ['SERVICE_NAME', 'SERVICE_ID', 'CORTEX_SEARCH_SERVICE_NAME']:
+            if col in df_search.columns:
+                service_col = col
+                break
+        
+        if service_col:
+            # Build aggregation dict based on available columns
+            agg_dict = {}
+            if 'TOTAL_CREDITS' in df_search.columns:
+                agg_dict['TOTAL_CREDITS'] = 'sum'
+            if 'SEARCH_REQUEST_COUNT' in df_search.columns:
+                agg_dict['SEARCH_REQUEST_COUNT'] = 'sum'
+            if 'SEARCH_RESULT_RANK_COUNT' in df_search.columns:
+                agg_dict['SEARCH_RESULT_RANK_COUNT'] = 'sum'
+            
+            # Only aggregate if we have columns to aggregate
+            if agg_dict:
+                service_usage = df_search.groupby(service_col).agg(agg_dict).reset_index()
+            else:
+                # If no aggregation columns, just count rows per service
+                service_usage = df_search.groupby(service_col).size().reset_index(name='COUNT')
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if 'TOTAL_CREDITS' in service_usage.columns:
+                    chart = alt.Chart(service_usage).mark_bar().encode(
+                        x=alt.X('TOTAL_CREDITS:Q', title='Total Credits'),
+                        y=alt.Y(f'{service_col}:N', title='Service', sort='-x'),
+                        color=alt.Color('TOTAL_CREDITS:Q', scale=alt.Scale(scheme='greens')),
+                        tooltip=[f'{service_col}:N', 'TOTAL_CREDITS:Q'] + 
+                               (['SEARCH_REQUEST_COUNT:Q'] if 'SEARCH_REQUEST_COUNT' in service_usage.columns else [])
+                    ).properties(
+                        title="Credits by Search Service",
+                        height=300
+                    )
+                elif 'SEARCH_REQUEST_COUNT' in service_usage.columns:
+                    chart = alt.Chart(service_usage).mark_bar().encode(
+                        x=alt.X('SEARCH_REQUEST_COUNT:Q', title='Search Requests'),
+                        y=alt.Y(f'{service_col}:N', title='Service', sort='-x'),
+                        color=alt.Color('SEARCH_REQUEST_COUNT:Q', scale=alt.Scale(scheme='greens')),
+                        tooltip=[f'{service_col}:N', 'SEARCH_REQUEST_COUNT:Q']
+                    ).properties(
+                        title="Requests by Search Service",
+                        height=300
+                    )
+                else:
+                    chart = alt.Chart(service_usage).mark_bar().encode(
+                        x=alt.X('COUNT:Q', title='Record Count'),
+                        y=alt.Y(f'{service_col}:N', title='Service', sort='-x'),
+                        color=alt.Color('COUNT:Q', scale=alt.Scale(scheme='greens')),
+                        tooltip=[f'{service_col}:N', 'COUNT:Q']
+                    ).properties(
+                        title="Activity by Search Service",
+                        height=300
+                    )
+                st.altair_chart(chart, use_container_width=True)
+            
+            with col2:
+                # Service type distribution
+                if 'SERVICE_TYPE' in df_search.columns and 'TOTAL_CREDITS' in df_search.columns:
+                    type_dist = df_search.groupby('SERVICE_TYPE')['TOTAL_CREDITS'].sum().reset_index()
+                    
+                    chart = alt.Chart(type_dist).mark_arc().encode(
+                        theta=alt.Theta('TOTAL_CREDITS:Q'),
+                        color=alt.Color('SERVICE_TYPE:N'),
+                        tooltip=['SERVICE_TYPE:N', 'TOTAL_CREDITS:Q']
+                    ).properties(
+                        title="Service Type Distribution",
+                        height=300
+                    )
+                    st.altair_chart(chart, use_container_width=True)
+        
+        # Daily trend
+        st.subheader("📈 Daily Search Activity")
+        
+        if 'USAGE_DATE' in df_search.columns:
+            # Build aggregation dict based on available columns
+            agg_dict = {}
+            if 'TOTAL_CREDITS' in df_search.columns:
+                agg_dict['TOTAL_CREDITS'] = 'sum'
+            if 'SEARCH_REQUEST_COUNT' in df_search.columns:
+                agg_dict['SEARCH_REQUEST_COUNT'] = 'sum'
+            
+            if agg_dict:
+                daily_search = df_search.groupby('USAGE_DATE').agg(agg_dict).reset_index()
+            else:
+                # If no aggregation columns, just count rows per day
+                daily_search = df_search.groupby('USAGE_DATE').size().reset_index(name='COUNT')
+            
+            # Create chart based on available columns
+            if 'SEARCH_REQUEST_COUNT' in daily_search.columns:
+                chart = alt.Chart(daily_search).mark_line(point=True).encode(
+                    x=alt.X('USAGE_DATE:T', title='Date'),
+                    y=alt.Y('SEARCH_REQUEST_COUNT:Q', title='Search Requests'),
+                    tooltip=['USAGE_DATE:T', 'SEARCH_REQUEST_COUNT:Q'] + 
+                           (['TOTAL_CREDITS:Q'] if 'TOTAL_CREDITS' in daily_search.columns else [])
+                ).properties(
+                    title="Daily Search Request Volume",
+                    height=300
+                )
+            elif 'TOTAL_CREDITS' in daily_search.columns:
+                chart = alt.Chart(daily_search).mark_line(point=True).encode(
+                    x=alt.X('USAGE_DATE:T', title='Date'),
+                    y=alt.Y('TOTAL_CREDITS:Q', title='Credits Used'),
+                    tooltip=['USAGE_DATE:T', 'TOTAL_CREDITS:Q']
+                ).properties(
+                    title="Daily Search Credits Usage",
+                    height=300
+                )
+            else:
+                chart = alt.Chart(daily_search).mark_line(point=True).encode(
+                    x=alt.X('USAGE_DATE:T', title='Date'),
+                    y=alt.Y('COUNT:Q', title='Number of Records'),
+                    tooltip=['USAGE_DATE:T', 'COUNT:Q']
+                ).properties(
+                    title="Daily Search Activity",
+                    height=300
+                )
+            
+            st.altair_chart(chart, use_container_width=True)
+    else:
+        st.info("No Cortex Search data available for the selected period")
+        if 'cortex_search' in table_info and table_info['cortex_search']['available']:
+            st.warning("Data was fetched but may be missing expected columns. Check the debug expander above for available columns.")
+    
+    # Tab-specific footer
+    st.markdown("---")
+    st.markdown(f"""
+    ### 🔎 Cortex Search Information:
+    - **Date Range**: {date_range}
+    - **Data Source**: SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_DAILY_USAGE_HISTORY
+    - **Records Loaded**: {len(df_search):,}
+    - **Last Refreshed**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    - **Note**: This is a daily aggregate table, showing one record per service per day
+    """)
+
+with tab4:
+    st.header("📋 Raw Data & Export")
+    
+    # Data source selector
+    data_source = st.selectbox(
+        "Select Data Source",
+        ["Cortex Functions", "Cortex Analyst", "Cortex Search"]
+    )
+    
+    # Select appropriate dataframe
+    if data_source == "Cortex Functions":
+        df_display = df_functions
+    elif data_source == "Cortex Analyst":
+        df_display = df_analyst
+    else:
+        df_display = df_search
+    
+    # Enhanced filters with select all functionality
+    if not df_display.empty:
+        # Get available filter columns based on data source and what's actually in the data
+        if data_source == "Cortex Functions":
+            possible_filter_cols = ['FUNCTION_NAME', 'MODEL_NAME', 'USER_NAME', 'ROLE_NAME', 'WAREHOUSE_NAME']
+        elif data_source == "Cortex Analyst":
+            possible_filter_cols = ['SERVICE_NAME', 'SERVICE_ID', 'MODEL_NAME', 'DATABASE_NAME', 
+                                  'DATABASE_ID', 'SCHEMA_NAME', 'SCHEMA_ID', 'USER_NAME', 'ROLE_NAME']
+        else:
+            possible_filter_cols = ['SERVICE_NAME', 'SERVICE_ID', 'SERVICE_TYPE', 'DATABASE_NAME', 
+                                  'DATABASE_ID', 'SCHEMA_NAME', 'SCHEMA_ID']
+        
+        # Only use columns that actually exist in the dataframe
+        filter_cols = [col for col in possible_filter_cols if col in df_display.columns]
+        
+        # Apply filters
+        filters = []
+        for col in filter_cols:
+            unique_vals = safe_get_column_values(df_display, col)
+            if unique_vals:
+                selected_vals = create_multiselect_with_all(
+                    f"Filter by {col.replace('_', ' ').title()}", 
+                    unique_vals, 
+                    f"{data_source}_{col}"
+                )
+                if selected_vals:
+                    filters.append(df_display[col].isin(selected_vals))
+        
+        # Apply all filters
+        if filters:
+            filtered_df = df_display[pd.concat(filters, axis=1).all(axis=1)]
+        else:
+            filtered_df = df_display
+        
+        # Format display
+        display_df = filtered_df.copy()
+        if 'TOTAL_SPEND' in display_df.columns:
+            display_df['TOTAL_SPEND'] = display_df['TOTAL_SPEND'].apply(lambda x: f"${x:,.2f}")
+        
+        st.dataframe(display_df, use_container_width=True)
+        
+        # Download button
+        if not filtered_df.empty:
+            csv = filtered_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                f"📥 Download {data_source} Data as CSV",
+                csv,
+                f"{data_source.lower().replace(' ', '_')}_data.csv",
+                "text/csv"
+            )
+    else:
+        st.info(f"No {data_source} data available for export")
+    
+    # Tab-specific footer
+    st.markdown("---")
+    
+    # Get original dataframe size
+    if data_source == "Cortex Functions":
+        original_size = len(df_functions)
+    elif data_source == "Cortex Analyst":
+        original_size = len(df_analyst)
+    else:
+        original_size = len(df_search)
+    
+    st.markdown(f"""
+    ### 📋 Raw Data Export Information:
+    - **Current View**: {data_source}
+    - **Records Available**: {len(df_display):,} {"(filtered)" if not df_display.empty and len(df_display) < original_size else "(all)"}
+    - **Export Format**: CSV
+    - **Tip**: Use the filters above to narrow down data before exporting
+    """)
+
+# Footer with general information (outside of tabs)
+st.markdown("---")
+st.markdown(f"""
+### 📊 Dashboard Settings:
+- **Price per Credit**: ${price_per_credit:.2f}
+- **Date Range Filter**: {date_range}
+- **Auto-refresh**: Click the 🔄 Refresh Data button in sidebar
+
+### 🚨 General Troubleshooting:
+- **No data showing?** Try a longer date range or check if Cortex services have been used
+- **Permission errors?** Contact your Snowflake admin for ACCOUNT_USAGE access
+- **Missing columns?** Different Snowflake editions may have different table schemas
+""")
