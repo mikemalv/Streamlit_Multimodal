@@ -304,17 +304,38 @@ def get_cortex_analyst_data(days):
         select_parts.append(f"DATE_TRUNC('DAY', {time_col}) AS USAGE_DATE")
         group_by_parts.append("USAGE_DATE")
         
-        # Add available dimension columns
-        dimension_cols = ['DATABASE_ID', 'SCHEMA_ID', 'SERVICE_NAME', 'SERVICE_ID', 'MODEL_NAME', 
-                         'USER_NAME', 'ROLE_NAME', 'WAREHOUSE_NAME']
+        # Add available dimension columns - check for both ID and NAME versions
+        dimension_mappings = {
+            'DATABASE_NAME': ['DATABASE_NAME', 'DATABASE_ID'],
+            'SCHEMA_NAME': ['SCHEMA_NAME', 'SCHEMA_ID'],
+            'SERVICE_NAME': ['CORTEX_ANALYST_SERVICE_NAME', 'CORTEX_ANALYST_SERVICE_ID', 'SERVICE_NAME', 'SERVICE_ID'],
+            'MODEL_NAME': ['MODEL_NAME', 'MODEL_ID'],
+            'USER_NAME': ['USER_NAME', 'USER_ID'],
+            'ROLE_NAME': ['ROLE_NAME', 'ROLE_ID'],
+            'WAREHOUSE_NAME': ['WAREHOUSE_NAME', 'WAREHOUSE_ID']
+        }
         
-        for col in dimension_cols:
-            if col in columns:
-                select_parts.append(col)
-                group_by_parts.append(col)
+        for output_name, possible_cols in dimension_mappings.items():
+            for col in possible_cols:
+                if col in columns:
+                    if col != output_name:
+                        select_parts.append(f"{col} AS {output_name}")
+                    else:
+                        select_parts.append(col)
+                    group_by_parts.append(output_name)
+                    break
         
         # Add aggregation columns
-        agg_parts = ["COUNT(*) AS TOTAL_QUERIES"]
+        agg_parts = []
+        
+        # Request count - renamed to match what visualization expects
+        if 'REQUEST_COUNT' in columns:
+            agg_parts.append("SUM(REQUEST_COUNT) AS TOTAL_REQUESTS")
+        else:
+            agg_parts.append("COUNT(*) AS TOTAL_REQUESTS")
+        
+        # Always add a query count for backward compatibility
+        agg_parts.append("COUNT(*) AS TOTAL_QUERIES")
         
         # Token columns
         if 'TOKENS_INPUT' in columns:
@@ -355,7 +376,21 @@ def get_cortex_analyst_data(days):
         # Log available columns for debugging
         if 'cortex_analyst' in table_info and table_info['cortex_analyst']['columns']:
             st.info(f"Available columns: {', '.join(table_info['cortex_analyst']['columns'])}")
-        return pd.DataFrame()
+        
+        # Try a simpler fallback query
+        try:
+            st.info("Trying simplified query...")
+            fallback_query = f"""
+            SELECT *
+            FROM {table}
+            WHERE {time_col} >= DATEADD(day, -{days}, CURRENT_TIMESTAMP)
+            LIMIT 100
+            """
+            df = session.sql(fallback_query).to_pandas()
+            st.success(f"Fallback query returned {len(df)} rows")
+            return df
+        except:
+            return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
 def get_cortex_search_data(days):
@@ -563,7 +598,7 @@ with tab1:
     if not df_analyst.empty:
         total_credits += df_analyst['TOTAL_CREDITS'].sum() if 'TOTAL_CREDITS' in df_analyst.columns else 0
         total_tokens += df_analyst['TOTAL_TOKENS'].sum() if 'TOTAL_TOKENS' in df_analyst.columns else 0
-        total_requests += df_analyst['TOTAL_QUERIES'].sum() if 'TOTAL_QUERIES' in df_analyst.columns else 0
+        total_requests += df_analyst['TOTAL_REQUESTS'].sum() if 'TOTAL_REQUESTS' in df_analyst.columns else 0
     
     if not df_search.empty:
         total_credits += df_search['TOTAL_CREDITS'].sum() if 'TOTAL_CREDITS' in df_search.columns else 0
@@ -654,8 +689,8 @@ with tab1:
                 st.metric("🏆 Top Model", top_model)
                 model_found = True
         
-        if not model_found and not df_analyst.empty and 'MODEL_NAME' in df_analyst.columns and 'TOTAL_QUERIES' in df_analyst.columns:
-            model_usage = df_analyst.groupby('MODEL_NAME')['TOTAL_QUERIES'].sum()
+        if not model_found and not df_analyst.empty and 'MODEL_NAME' in df_analyst.columns and 'TOTAL_REQUESTS' in df_analyst.columns:
+            model_usage = df_analyst.groupby('MODEL_NAME')['TOTAL_REQUESTS'].sum()
             if not model_usage.empty:
                 top_model = model_usage.idxmax()
                 st.metric("🏆 Top Model", top_model)
@@ -966,7 +1001,7 @@ with tab1:
             'Service': 'Cortex Analyst',
             'Total Credits': f"{credits:.1f}",
             'Total Spend': format_currency(df_analyst['TOTAL_SPEND'].sum() if 'TOTAL_SPEND' in df_analyst.columns else 0),
-            'Total Requests': format_number(df_analyst['TOTAL_QUERIES'].sum() if 'TOTAL_QUERIES' in df_analyst.columns else 0),
+            'Total Requests': format_number(df_analyst['TOTAL_REQUESTS'].sum() if 'TOTAL_REQUESTS' in df_analyst.columns else 0),
             'Unique Models': df_analyst['MODEL_NAME'].nunique() if 'MODEL_NAME' in df_analyst.columns else 0,
             'Active Days': df_analyst['USAGE_DATE'].dt.date.nunique() if 'USAGE_DATE' in df_analyst.columns else 0
         })
@@ -1099,7 +1134,7 @@ with tab1:
                 
                 st.altair_chart(chart, use_container_width=True)
             else:
-                st.info("Token efficiency analysis requires token data")
+                st.info("Token efficiency analysis requires both token and model data")
     
     # Overview tab footer
     st.markdown("---")
@@ -1116,9 +1151,26 @@ with tab2:
     st.header("🧠 Cortex Analyst Usage")
     
     if not df_analyst.empty:
-        # Debug info to help understand schema
-        with st.expander("🔧 Debug: Available Cortex Analyst Columns"):
-            st.write(f"Columns in dataset: {', '.join(df_analyst.columns.tolist())}")
+        # Add debug information about the data
+        with st.expander("🔧 Debug: Query and Data Info"):
+            st.write("**Query Info:**")
+            st.write(f"- Table accessed: CORTEX_ANALYST_USAGE_HISTORY")
+            st.write(f"- Records returned: {len(df_analyst)}")
+            st.write(f"- Date range: {date_range}")
+            
+            if not df_analyst.empty:
+                st.write("\n**Column Mapping:**")
+                st.write("The query renames columns to standardize them:")
+                st.write("- CORTEX_ANALYST_SERVICE_NAME/ID → SERVICE_NAME")
+                st.write("- DATABASE_ID → DATABASE_NAME")
+                st.write("- REQUEST_COUNT → TOTAL_REQUESTS (aggregated)")
+                st.write("- CREDITS_USED → TOTAL_CREDITS (aggregated)")
+                
+                st.write("\n**Actual columns in dataframe:**")
+                st.write(df_analyst.columns.tolist())
+                
+                st.write("\n**Sample of actual data:**")
+                st.dataframe(df_analyst.head())
         
         # Metrics
         col1, col2, col3, col4 = st.columns(4)
@@ -1132,19 +1184,62 @@ with tab2:
             st.metric("💰 Total Spend", format_currency(analyst_spend))
         
         with col3:
-            analyst_queries = df_analyst['TOTAL_QUERIES'].sum() if 'TOTAL_QUERIES' in df_analyst.columns else 0
-            st.metric("🔍 Total Queries", format_number(analyst_queries))
+            analyst_requests = df_analyst['TOTAL_REQUESTS'].sum() if 'TOTAL_REQUESTS' in df_analyst.columns else 0
+            st.metric("🔍 Total Requests", format_number(analyst_requests))
         
         with col4:
             analyst_tokens = df_analyst['TOTAL_TOKENS'].sum() if 'TOTAL_TOKENS' in df_analyst.columns else 0
             st.metric("🔢 Total Tokens", format_number(analyst_tokens))
         
+        # Second row of metrics for additional insights
+        col5, col6, col7, col8 = st.columns(4)
+        
+        with col5:
+            # Average credits per request
+            if analyst_credits > 0 and analyst_requests > 0:
+                avg_credits_per_request = analyst_credits / analyst_requests
+                st.metric("💎 Avg Credits/Request", f"{avg_credits_per_request:.4f}")
+            else:
+                st.metric("💎 Avg Credits/Request", "N/A")
+        
+        with col6:
+            # Average tokens per request
+            if analyst_tokens > 0 and analyst_requests > 0:
+                avg_tokens_per_request = analyst_tokens / analyst_requests
+                st.metric("📝 Avg Tokens/Request", f"{avg_tokens_per_request:.0f}")
+            else:
+                st.metric("📝 Avg Tokens/Request", "N/A")
+        
+        with col7:
+            # Unique databases
+            if 'DATABASE_NAME' in df_analyst.columns:
+                unique_dbs = df_analyst['DATABASE_NAME'].nunique()
+                st.metric("🗄️ Unique Databases", unique_dbs)
+            else:
+                st.metric("🗄️ Unique Databases", "N/A")
+        
+        with col8:
+            # Active days
+            if 'USAGE_DATE' in df_analyst.columns:
+                active_days = df_analyst['USAGE_DATE'].dt.date.nunique()
+                st.metric("📅 Active Days", active_days)
+            else:
+                st.metric("📅 Active Days", "N/A")
+        
         # Service usage - dynamically find service name column
         st.subheader("📊 Analyst Service Usage")
         
-        # Find the service name column
+        # Show a sample of the data structure for debugging
+        with st.expander("🔍 View Raw Analyst Data Sample"):
+            st.write("First few rows of Cortex Analyst data:")
+            st.dataframe(df_analyst.head())
+        
+        # Find the service name column - expand the search
         service_col = None
-        for col in ['SERVICE_NAME', 'SERVICE_ID', 'CORTEX_ANALYST_SERVICE_NAME']:
+        possible_service_cols = ['SERVICE_NAME', 'SERVICE_ID', 'CORTEX_ANALYST_SERVICE_NAME', 
+                                'DATABASE_NAME', 'DATABASE_ID', 'SCHEMA_NAME']
+        
+        for col in possible_service_cols:
             if col in df_analyst.columns:
                 service_col = col
                 break
@@ -1166,61 +1261,130 @@ with tab2:
                 # If no aggregation columns, just count rows per service
                 service_usage = df_analyst.groupby(service_col).size().reset_index(name='COUNT')
             
-            col1, col2 = st.columns(2)
+            # Check if we have both service usage and model data
+            has_service_data = not service_usage.empty if 'service_usage' in locals() else False
+            has_model_data = 'MODEL_NAME' in df_analyst.columns and 'TOTAL_CREDITS' in df_analyst.columns
             
-            with col1:
-                if not service_usage.empty:
-                    if 'TOTAL_CREDITS' in service_usage.columns:
-                        chart = alt.Chart(service_usage).mark_bar().encode(
-                            x=alt.X('TOTAL_CREDITS:Q', title='Total Credits'),
-                            y=alt.Y(f'{service_col}:N', title='Service', sort='-x'),
-                            color=alt.Color('TOTAL_CREDITS:Q', scale=alt.Scale(scheme='blues')),
-                            tooltip=[f'{service_col}:N', 'TOTAL_CREDITS:Q'] + 
-                                   (['TOTAL_QUERIES:Q'] if 'TOTAL_QUERIES' in service_usage.columns else [])
-                        ).properties(
-                            title="Credits by Analyst Service",
-                            height=300
-                        )
-                    elif 'TOTAL_QUERIES' in service_usage.columns:
-                        chart = alt.Chart(service_usage).mark_bar().encode(
-                            x=alt.X('TOTAL_QUERIES:Q', title='Total Queries'),
-                            y=alt.Y(f'{service_col}:N', title='Service', sort='-x'),
-                            color=alt.Color('TOTAL_QUERIES:Q', scale=alt.Scale(scheme='blues')),
-                            tooltip=[f'{service_col}:N', 'TOTAL_QUERIES:Q']
-                        ).properties(
-                            title="Queries by Analyst Service",
-                            height=300
-                        )
+            if has_service_data and has_model_data:
+                col1, col2 = st.columns(2)
+            elif has_service_data or has_model_data:
+                col1 = st.container()
+                col2 = None
+            else:
+                col1 = col2 = None
+            
+            if col1 and has_service_data:
+                with col1:
+                    if not service_usage.empty:
+                        if 'TOTAL_CREDITS' in service_usage.columns:
+                            chart = alt.Chart(service_usage).mark_bar().encode(
+                                x=alt.X('TOTAL_CREDITS:Q', title='Total Credits'),
+                                y=alt.Y(f'{service_col}:N', title='Service', sort='-x'),
+                                color=alt.Color('TOTAL_CREDITS:Q', scale=alt.Scale(scheme='blues')),
+                                tooltip=[f'{service_col}:N', 'TOTAL_CREDITS:Q'] + 
+                                       (['TOTAL_QUERIES:Q'] if 'TOTAL_QUERIES' in service_usage.columns else [])
+                            ).properties(
+                                title="Credits by Analyst Service",
+                                height=300
+                            )
+                        elif 'TOTAL_QUERIES' in service_usage.columns:
+                            chart = alt.Chart(service_usage).mark_bar().encode(
+                                x=alt.X('TOTAL_QUERIES:Q', title='Total Queries'),
+                                y=alt.Y(f'{service_col}:N', title='Service', sort='-x'),
+                                color=alt.Color('TOTAL_QUERIES:Q', scale=alt.Scale(scheme='blues')),
+                                tooltip=[f'{service_col}:N', 'TOTAL_QUERIES:Q']
+                            ).properties(
+                                title="Queries by Analyst Service",
+                                height=300
+                            )
+                        else:
+                            chart = alt.Chart(service_usage).mark_bar().encode(
+                                x=alt.X('COUNT:Q', title='Record Count'),
+                                y=alt.Y(f'{service_col}:N', title='Service', sort='-x'),
+                                color=alt.Color('COUNT:Q', scale=alt.Scale(scheme='blues')),
+                                tooltip=[f'{service_col}:N', 'COUNT:Q']
+                            ).properties(
+                                title="Activity by Analyst Service",
+                                height=300
+                            )
+                        st.altair_chart(chart, use_container_width=True)
                     else:
-                        chart = alt.Chart(service_usage).mark_bar().encode(
-                            x=alt.X('COUNT:Q', title='Record Count'),
-                            y=alt.Y(f'{service_col}:N', title='Service', sort='-x'),
-                            color=alt.Color('COUNT:Q', scale=alt.Scale(scheme='blues')),
-                            tooltip=[f'{service_col}:N', 'COUNT:Q']
-                        ).properties(
-                            title="Activity by Analyst Service",
-                            height=300
-                        )
-                    st.altair_chart(chart, use_container_width=True)
-                else:
-                    st.info("No service usage data to display")
+                        st.info("No service usage data to display")
             
-            with col2:
-                # Model distribution
-                if 'MODEL_NAME' in df_analyst.columns and 'TOTAL_CREDITS' in df_analyst.columns:
+            if col2 and has_model_data:
+                with col2:
+                    # Model distribution
                     model_dist = df_analyst.groupby('MODEL_NAME')['TOTAL_CREDITS'].sum().reset_index()
                     
-                    chart = alt.Chart(model_dist).mark_arc().encode(
-                        theta=alt.Theta('TOTAL_CREDITS:Q'),
-                        color=alt.Color('MODEL_NAME:N'),
-                        tooltip=['MODEL_NAME:N', 'TOTAL_CREDITS:Q']
+                    if not model_dist.empty:
+                        chart = alt.Chart(model_dist).mark_arc().encode(
+                            theta=alt.Theta('TOTAL_CREDITS:Q'),
+                            color=alt.Color('MODEL_NAME:N'),
+                            tooltip=['MODEL_NAME:N', 'TOTAL_CREDITS:Q']
+                        ).properties(
+                            title="Model Usage Distribution",
+                            height=300
+                        )
+                        st.altair_chart(chart, use_container_width=True)
+                    else:
+                        st.info("No model usage data to display")
+        else:
+            st.info("Service column not found in the data. Available columns in debug expander above.")
+        
+        # Model distribution - show separately if available
+        if 'MODEL_NAME' in df_analyst.columns and 'TOTAL_CREDITS' in df_analyst.columns:
+            st.subheader("📊 Model Usage Distribution")
+            model_dist = df_analyst.groupby('MODEL_NAME')['TOTAL_CREDITS'].sum().reset_index()
+            
+            if not model_dist.empty:
+                chart = alt.Chart(model_dist).mark_arc().encode(
+                    theta=alt.Theta('TOTAL_CREDITS:Q'),
+                    color=alt.Color('MODEL_NAME:N'),
+                    tooltip=['MODEL_NAME:N', 'TOTAL_CREDITS:Q']
+                ).properties(
+                    title="Credits by Model",
+                    height=300
+                )
+                st.altair_chart(chart, use_container_width=True)
+        
+        # Efficiency metrics
+        if 'TOTAL_CREDITS' in df_analyst.columns and 'TOTAL_REQUESTS' in df_analyst.columns:
+            st.subheader("📊 Efficiency Metrics")
+            
+            # Calculate average credits per request by model
+            if 'MODEL_NAME' in df_analyst.columns:
+                model_efficiency = df_analyst.groupby('MODEL_NAME').agg({
+                    'TOTAL_CREDITS': 'sum',
+                    'TOTAL_REQUESTS': 'sum'
+                }).reset_index()
+                
+                model_efficiency['CREDITS_PER_REQUEST'] = model_efficiency.apply(
+                    lambda row: row['TOTAL_CREDITS'] / row['TOTAL_REQUESTS'] if row['TOTAL_REQUESTS'] > 0 else 0,
+                    axis=1
+                ).round(4)
+                
+                model_efficiency = model_efficiency[model_efficiency['TOTAL_REQUESTS'] > 0]
+                
+                if not model_efficiency.empty:
+                    model_efficiency = model_efficiency.sort_values('CREDITS_PER_REQUEST')
+                    
+                    chart = alt.Chart(model_efficiency).mark_bar().encode(
+                        x=alt.X('CREDITS_PER_REQUEST:Q', title='Credits per Request'),
+                        y=alt.Y('MODEL_NAME:N', title='Model', sort='x'),
+                        color=alt.Color('CREDITS_PER_REQUEST:Q', scale=alt.Scale(scheme='goldgreen', reverse=True)),
+                        tooltip=[
+                            alt.Tooltip('MODEL_NAME:N', title='Model'),
+                            alt.Tooltip('CREDITS_PER_REQUEST:Q', title='Credits/Request', format='.4f'),
+                            alt.Tooltip('TOTAL_CREDITS:Q', title='Total Credits', format=',.1f'),
+                            alt.Tooltip('TOTAL_REQUESTS:Q', title='Total Requests', format=',')
+                        ]
                     ).properties(
-                        title="Model Usage Distribution",
+                        title="Model Efficiency (Lower is Better)",
                         height=300
                     )
                     st.altair_chart(chart, use_container_width=True)
         
-        # Token breakdown
+        # Token usage breakdown if available
         if 'TOTAL_INPUT_TOKENS' in df_analyst.columns and 'TOTAL_OUTPUT_TOKENS' in df_analyst.columns:
             st.subheader("📝 Token Usage Breakdown")
             
@@ -1449,7 +1613,8 @@ with tab4:
             possible_filter_cols = ['FUNCTION_NAME', 'MODEL_NAME', 'USER_NAME', 'ROLE_NAME', 'WAREHOUSE_NAME']
         elif data_source == "Cortex Analyst":
             possible_filter_cols = ['SERVICE_NAME', 'SERVICE_ID', 'MODEL_NAME', 'DATABASE_NAME', 
-                                  'DATABASE_ID', 'SCHEMA_NAME', 'SCHEMA_ID', 'USER_NAME', 'ROLE_NAME']
+                                  'DATABASE_ID', 'SCHEMA_NAME', 'SCHEMA_ID', 'USER_NAME', 'ROLE_NAME', 
+                                  'CORTEX_ANALYST_SERVICE_NAME', 'CORTEX_ANALYST_SERVICE_ID']
         else:
             possible_filter_cols = ['SERVICE_NAME', 'SERVICE_ID', 'SERVICE_TYPE', 'DATABASE_NAME', 
                                   'DATABASE_ID', 'SCHEMA_NAME', 'SCHEMA_ID']
