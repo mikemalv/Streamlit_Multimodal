@@ -1586,14 +1586,14 @@ def analyze_multiple_images_COMPREHENSIVE(uploaded_files, model_option):
         # COMPREHENSIVE MULTI-IMAGE PROCESSING
         st.info(f"🚀 **Processing** {len(uploaded_file_names)} images...")
         
-        # Handle different numbers of images based on CORTEX.COMPLETE limitations
+        # Handle different numbers of images based on CORTEX.AI_COMPLETE limitations
         if len(uploaded_file_names) == 1:
             if st.session_state.get('debug_mode', False):
-                st.info("🔧 Using single-image CORTEX.COMPLETE approach")
+                st.info("🔧 Using single-image CORTEX.AI_COMPLETE approach")
             processing_method = "single"
         elif len(uploaded_file_names) == 2:
             if st.session_state.get('debug_mode', False):
-                st.info("🔧 Using dual-image CORTEX.COMPLETE approach")
+                st.info("🔧 Using dual-image CORTEX.AI_COMPLETE approach")
             processing_method = "dual"
         elif len(uploaded_file_names) <= 10:
             if st.session_state.get('debug_mode', False):
@@ -1692,18 +1692,18 @@ Provide detailed, accurate analysis focusing on maximizing data extraction from 
         
         # Create appropriate query based on processing method
         if processing_method == "single":
-            # Single image: CORTEX.COMPLETE(model, prompt, image)
+            # Single image: CORTEX.AI_COMPLETE(model, prompt, image)
             analysis_prompt_escaped = comprehensive_prompt.replace("'", "''").replace("\\", "\\\\")
-            analysis_query = f"""SELECT SNOWFLAKE.CORTEX.COMPLETE(
+            analysis_query = f"""SELECT SNOWFLAKE.CORTEX.AI_COMPLETE(
     '{model_option}',
     '{analysis_prompt_escaped}',
     {to_file_calls[0]}
 )"""
             
         elif processing_method == "dual":
-            # Dual image: CORTEX.COMPLETE(model, prompt, image1, image2)
+            # Dual image: CORTEX.AI_COMPLETE(model, prompt, image1, image2)
             analysis_prompt_escaped = comprehensive_prompt.replace("'", "''").replace("\\", "\\\\")
-            analysis_query = f"""SELECT SNOWFLAKE.CORTEX.COMPLETE(
+            analysis_query = f"""SELECT SNOWFLAKE.CORTEX.AI_COMPLETE(
     '{model_option}',
     '{analysis_prompt_escaped}',
     {to_file_calls[0]},
@@ -1789,7 +1789,7 @@ Grade condition 1-10 scale. Examine all angles for comprehensive analysis. Extra
             # Create PROMPT function call following Snowflake documentation syntax exactly
             # PROMPT('text with {0} {1} placeholders', TO_FILE1, TO_FILE2, ...)
             to_file_joined = ',\n        '.join(to_file_calls)
-            analysis_query = f"""SELECT SNOWFLAKE.CORTEX.COMPLETE(
+            analysis_query = f"""SELECT SNOWFLAKE.CORTEX.AI_COMPLETE(
     '{model_option}',
     PROMPT('{prompt_escaped}',
         {to_file_joined})
@@ -1813,7 +1813,7 @@ Grade condition 1-10 scale. Examine all angles for comprehensive analysis. Extra
             st.text_area("Complete SQL Query", analysis_query, height=300)
             
             # Show the arguments being passed
-            st.write("🔍 **CORTEX.COMPLETE Arguments:**")
+            st.write("🔍 **CORTEX.AI_COMPLETE Arguments:**")
             st.code(f"Model: {model_option}")
             st.code(f"Processing Method: {processing_method}")
             st.code(f"Prompt Length: {len(comprehensive_prompt)} characters")
@@ -1823,10 +1823,10 @@ Grade condition 1-10 scale. Examine all angles for comprehensive analysis. Extra
             # Show argument count validation
             if processing_method == "single":
                 expected_args = 3  # model + prompt + 1 image
-                st.info(f"✅ Single image: Using {expected_args} arguments (within CORTEX.COMPLETE limit)")
+                st.info(f"✅ Single image: Using {expected_args} arguments (within CORTEX.AI_COMPLETE limit)")
             elif processing_method == "dual":
                 expected_args = 4  # model + prompt + 2 images  
-                st.info(f"✅ Dual image: Using {expected_args} arguments (at CORTEX.COMPLETE limit)")
+                st.info(f"✅ Dual image: Using {expected_args} arguments (at CORTEX.AI_COMPLETE limit)")
             else:
                 st.info(f"✅ Multi-image: Using PROMPT() function for {len(uploaded_file_names)} images")
         
@@ -1859,7 +1859,7 @@ Grade condition 1-10 scale. Examine all angles for comprehensive analysis. Extra
                     fallback_prompt = comprehensive_prompt.replace(f"these {len(uploaded_file_names)} golf club images", "these 2 golf club images")
                     fallback_prompt_escaped = fallback_prompt.replace("'", "''").replace("\\", "\\\\")
                     
-                    fallback_query = f"""SELECT SNOWFLAKE.CORTEX.COMPLETE(
+                    fallback_query = f"""SELECT SNOWFLAKE.CORTEX.AI_COMPLETE(
     '{model_option}',
     '{fallback_prompt_escaped}',
     {to_file_calls[0]},
@@ -1945,7 +1945,7 @@ def analyze_individual_image_COMPREHENSIVE(uploaded_file, model_option):
             
             # Create the analysis query with the selected model
             analysis_query = f"""
-            SELECT SNOWFLAKE.CORTEX.COMPLETE(
+            SELECT SNOWFLAKE.CORTEX.AI_COMPLETE(
                 '{model_option}',
                 '{analysis_prompt}',
                 TO_FILE('{stage_name}', '{file_name}')
@@ -2373,11 +2373,11 @@ def display_comprehensive_analysis_results(analysis_data, raw_output, file_names
     
     # Store the query info in session state if provided
     if 'last_analysis_query' in st.session_state:
-        with st.expander("💻 **CORTEX.COMPLETE Command Used**", expanded=False):
+        with st.expander("💻 **CORTEX.AI_COMPLETE Command Used**", expanded=False):
             st.code(st.session_state.last_analysis_query, language="sql")
     
     with st.expander("📝 **AI Response**", expanded=False):
-        st.text_area("Complete AI Analysis Response", raw_output, height=400, disabled=True)
+        st.code(raw_output, language="sql")
 
 # Function to fetch analysis history
 def fetch_analysis_history():
@@ -2767,17 +2767,53 @@ def display_enhanced_settings_page(model_option, auto_analyze=True):
     
     with st.expander("Model Performance Details"):
         model_info = {
+            "claude-4-opus": {
+                "Multi-Image": "✅ Exceptional",
+                "Data Extraction": "✅ Maximum",
+                "Condition Assessment": "✅ Superior",
+                "Market Analysis": "✅ Advanced"
+            },
             "claude-4-sonnet": {
                 "Multi-Image": "✅ Excellent",
                 "Data Extraction": "✅ Maximum",
                 "Condition Assessment": "✅ Superior",
                 "Market Analysis": "✅ Advanced"
             },
+            "openai-gpt-4.1": {
+                "Multi-Image": "✅ Excellent",
+                "Data Extraction": "✅ High",
+                "Condition Assessment": "✅ Superior",
+                "Market Analysis": "✅ Advanced"
+            },
+            "claude-3-7-sonnet": {
+                "Multi-Image": "✅ Excellent",
+                "Data Extraction": "✅ High",
+                "Condition Assessment": "✅ Good",
+                "Market Analysis": "✅ Good"
+            },
             "claude-3-5-sonnet": {
                 "Multi-Image": "✅ Excellent", 
                 "Data Extraction": "✅ High",
                 "Condition Assessment": "✅ Superior",
                 "Market Analysis": "✅ Good"
+            },
+            "llama-4-maverick": {
+                "Multi-Image": "✅ Good",
+                "Data Extraction": "⚠️ Moderate",
+                "Condition Assessment": "✅ Good",
+                "Market Analysis": "⚠️ Moderate"
+            },
+            "llama-4-scout": {
+                "Multi-Image": "✅ Good",
+                "Data Extraction": "⚠️ Moderate",
+                "Condition Assessment": "✅ Good",
+                "Market Analysis": "⚠️ Basic"
+            },
+            "openai-o4-mini": {
+                "Multi-Image": "⚠️ Limited",
+                "Data Extraction": "⚠️ Moderate",
+                "Condition Assessment": "✅ Good",
+                "Market Analysis": "⚠️ Basic"
             },
             "pixtral-large": {
                 "Multi-Image": "❌ Limited",
@@ -2851,19 +2887,26 @@ def main():
     # Enhanced sidebar
     st.sidebar.title("🏌️ Golf Club Analyzer V3")
     #st.sidebar.markdown("**COMPREHENSIVE EDITION**")
-    
+
     # Model selection with enhanced descriptions
     model_descriptions = {
+        "claude-4-opus": "🏆 Premium model for maximum accuracy and analysis",
         "claude-4-sonnet": "🥇 Best for comprehensive multi-image analysis",
-        "claude-3-5-sonnet": "🥈 Excellent multi-image with high accuracy", 
+        "openai-gpt-4.1": "🥇 Advanced multi-modal with strong reasoning",
+        "claude-3-7-sonnet": "🥈 Enhanced analysis with improved accuracy",
+        "claude-3-5-sonnet": "🥈 Excellent multi-image with high accuracy",
+        "llama-4-maverick": "🥉 Strong open-source alternative",
+        "llama-4-scout": "🥉 Fast and efficient analysis",
+        "openai-o4-mini": "⚡ Quick processing with good accuracy",
         "pixtral-large": "🥉 Good single-image analysis"
     }
     
     model_option = st.sidebar.selectbox(
         "🤖 AI Model Selection",
-        ["claude-4-sonnet", "claude-3-5-sonnet", "pixtral-large"],
-        index=0,
-        help="Claude-4-Sonnet recommended for maximum data extraction",
+        ["claude-4-opus", "claude-4-sonnet", "openai-gpt-4.1", "claude-3-7-sonnet", 
+         "claude-3-5-sonnet", "llama-4-maverick", "llama-4-scout", "openai-o4-mini", "pixtral-large"],
+        index=1,
+        help="Claude-4-Opus recommended for maximum data extraction",
         format_func=lambda x: f"{x} - {model_descriptions.get(x, '')}"
     )
     
